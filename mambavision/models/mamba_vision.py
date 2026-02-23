@@ -622,6 +622,112 @@ class MambaVisionLayer(nn.Module):
             return x
         return self.downsample(x)
 
+class BiMambaVisionLayer(nn.Module):
+    """
+    双向 MambaVision 模块 (Bi-directional Cognitive Modeling)
+    适用于时空特征，输入必须为 5D 张量: (B, T, C, H, W)
+    """
+    def __init__(self,
+                 dim,
+                 depth,
+                 num_heads,
+                 window_size,
+                 conv=False,
+                 downsample=False,
+                 mlp_ratio=4.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop=0.,
+                 attn_drop=0.,
+                 drop_path=0.,
+                 layer_scale=None,
+                 layer_scale_conv=None,
+                 transformer_blocks=[]):
+        super().__init__()
+        # 1. 沿通道一分为二
+        self.dim1 = dim // 2
+        self.dim2 = dim - self.dim1
+        
+        # 2. 两个独立的 MambaVision 实例 (处理拆分后的通道 dim1)
+        self.mamba_fwd = MambaVisionLayer(
+            dim=self.dim1, depth=depth, num_heads=num_heads, window_size=window_size,
+            conv=conv, downsample=downsample, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+            qk_scale=qk_scale, drop=drop, attn_drop=attn_drop, drop_path=drop_path,
+            layer_scale=layer_scale, layer_scale_conv=layer_scale_conv, 
+            transformer_blocks=transformer_blocks
+        )
+        
+        self.mamba_bwd = MambaVisionLayer(
+            dim=self.dim1, depth=depth, num_heads=num_heads, window_size=window_size,
+            conv=conv, downsample=downsample, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+            qk_scale=qk_scale, drop=drop, attn_drop=attn_drop, drop_path=drop_path,
+            layer_scale=layer_scale, layer_scale_conv=layer_scale_conv, 
+            transformer_blocks=transformer_blocks
+        )
+        
+        # 3. 对应时序的前向与后向 Conv1D
+        self.conv_fwd = nn.Conv1d(self.dim1, self.dim1, kernel_size=3, padding=1)
+        self.conv_bwd = nn.Conv1d(self.dim1, self.dim1, kernel_size=3, padding=1)
+        
+        # 4. 前后向融合层
+        self.W_fus = nn.Conv2d(self.dim1, self.dim1, kernel_size=1)
+        
+        # 5. 为了防止如果存在下采样 (downsample=True) 时维度错位，给分支 b 也配一个 downsample
+        self.downsample_b = Downsample(dim=self.dim2) if downsample else nn.Identity()
+
+    def forward(self, x):
+        """
+        x: 形状为 (B, T, C, H, W) 的时空特征
+        """
+        assert x.ndim == 5, f"BiMambaVisionLayer expects 5D input (B, T, C, H, W), but got {x.ndim}D."
+        B, T, C, H, W = x.shape
+        
+        # 将特征沿通道维度 C (dim=2) 拆分为 a 和 b
+        x_a, x_b = torch.split(x, [self.dim1, self.dim2], dim=2) 
+        
+        # ================= 前向流 (Forward Stream) =================
+        # 1. 将空间维度与 Batch 融合，暴露 T 维度给 Conv1D
+        x_a_seq = rearrange(x_a, 'b t c h w -> (b h w) c t')
+        x_a_fwd = self.conv_fwd(x_a_seq)
+        
+        # 2. 变换为 MambaVisionLayer 接受的 4D 形状 (B*T, C, H, W)
+        x_a_fwd = rearrange(x_a_fwd, '(b h w) c t -> (b t) c h w', b=B, h=H, w=W)
+        
+        # 3. 经过前向 Mamba
+        x_fwd = self.mamba_fwd(x_a_fwd) 
+        
+        # ================= 后向流 (Backward Stream) =================
+        # 1. 对 T 维度进行反转 (Time Reversal)
+        x_a_rev = torch.flip(x_a, dims=[1]) 
+        x_a_rev_seq = rearrange(x_a_rev, 'b t c h w -> (b h w) c t')
+        x_a_bwd = self.conv_bwd(x_a_rev_seq)
+        x_a_bwd = rearrange(x_a_bwd, '(b h w) c t -> (b t) c h w', b=B, h=H, w=W)
+        
+        # 2. 经过独立的后向 Mamba
+        x_bwd = self.mamba_bwd(x_a_bwd)
+        
+        # 3. 再次反转回正常的时序顺序
+        _, _, H_out, W_out = x_bwd.shape # 获取经过 Mamba 后的空间尺寸 (若有下采样会变小)
+        x_bwd = rearrange(x_bwd, '(b t) c h w -> b t c h w', b=B, t=T)
+        x_bwd = torch.flip(x_bwd, dims=[1])
+        x_bwd = rearrange(x_bwd, 'b t c h w -> (b t) c h w')
+        
+        # ================= 融合与残差 (Fusion & Skip-Connection) =================
+        # 1. 融合前向与后向预测
+        x_fus = x_fwd + x_bwd
+        x_fus = self.W_fus(x_fus)
+        
+        # 2. 处理另一半特征 b (如果 Mamba 执行了下采样，b 也要对齐空间尺寸)
+        x_b_flat = rearrange(x_b, 'b t c h w -> (b t) c h w')
+        x_b_flat = self.downsample_b(x_b_flat)
+        
+        # 3. 拼接通道以恢复总维度 (dim1 + dim2 = C)
+        out_flat = torch.cat([x_fus, x_b_flat], dim=1) # 输出维度 (B*T, C, H_out, W_out)
+        
+        # 重新打包回 5D 输出，方便后续层堆叠
+        out = rearrange(out_flat, '(b t) c h w -> b t c h w', b=B, t=T)
+        
+        return out
 
 class MambaVision(nn.Module):
     """

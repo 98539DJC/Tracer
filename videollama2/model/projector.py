@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.regnet import RegStage
 from timm.models.layers import LayerNorm2d, ConvNormAct, trunc_normal_
-from mambavision.models.mamba_vision import  MambaVisionLayer
+from mambavision.models.mamba_vision import  BiMambaVisionLayer
 from transformers import TRANSFORMERS_CACHE
 import math
 
@@ -431,7 +431,7 @@ class TracerMambaConnector(STCConnectorV35):
             dpr_stage = dpr_all[cursor: cursor + mv_depth] if drop_path > 0 else 0.0
             cursor += mv_depth
             layers.append(
-                MambaVisionLayer(
+                BiMambaVisionLayer(
                     dim=dim, depth=mv_depth, num_heads=num_heads, window_size=window_size,
                     conv=False, downsample=False, mlp_ratio=mlp_ratio, qkv_bias=True, qk_scale=None,
                     drop=drop_rate, attn_drop=attn_drop, drop_path=dpr_stage, layer_scale=layer_scale,
@@ -485,7 +485,7 @@ class TracerMambaConnector(STCConnectorV35):
         # (3) BCM 建模 (MambaVision)
         # 恢复回 MambaVisionLayer 习惯的 spatial batch 并行结构 (b*t, d, h, w)
         # 注意：此处 x_fwd 的 N 维度本质上是展平的 H*W
-        x_mamba_in = einops.rearrange(x_fwd, "b (h w) t d -> (b t) d h w", h=H, w=W)
+        x_mamba_in = einops.rearrange(x_fwd, "b (h w) t d -> b t d h w", h=H, w=W)
         self.m1(x_mamba_in)
         x_mamba_out = x_mamba_in 
         
