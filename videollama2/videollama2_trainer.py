@@ -248,6 +248,8 @@ class VideoLLaMA2Trainer(Trainer):
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
             if self.args.mm_projector_lr is not None:
                 projector_parameters = [name for name, _ in opt_model.named_parameters() if "mm_projector" in name]
+                _req = [n for n, p in opt_model.named_parameters() if p.requires_grad]
+                print(f'[CREATE_OPTIM] req_grad={len(_req)} decay={len(decay_parameters)} projector={len(projector_parameters)}', flush=True)
                 optimizer_grouped_parameters = [
                     {
                         "params": [
@@ -291,6 +293,9 @@ class VideoLLaMA2Trainer(Trainer):
                         "weight_decay": 0.0,
                     },
                 ]
+
+            for _i, _g in enumerate(optimizer_grouped_parameters):
+                print(f'[CREATE_OPTIM] group {_i}: n={len(_g["params"])}', flush=True)
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
@@ -375,7 +380,7 @@ class VideoLLaMA2Trainer(Trainer):
             pos_bwd = loss_data.get('pos_bwd') # (B, N, T, 2)
             
             B, N, T, D = x_fwd.shape
-            
+
             # --- 1) Semantic Consistency Loss (L_cor) ---
             # 强化对象一致性：利用指示器阻断复位处的相似度计算
             x_t = x_fwd[:, :, :-1, :]   # (B, N, T-1, D)
@@ -399,7 +404,8 @@ class VideoLLaMA2Trainer(Trainer):
 
             # --- 3) Trajectory Diversity Loss (L_div) ---
             # 排斥项：避免所有追踪点塌陷到同一个显著区域
-            delta_div = getattr(self.args, "delta_div", 1.0) # 可在 TrainingArguments 中配置带宽
+            # delta_div 即论文 Eq.18 的 σ_div，像素尺度带宽
+            delta_div = getattr(self.args,"delta_div", 1.0)
             loss_div_batch = torch.zeros(B, device=pos_fwd.device)
             
             # 避免 NxN 张量一次性展开导致 OOM，沿时间步计算
@@ -420,8 +426,8 @@ class VideoLLaMA2Trainer(Trainer):
                 repulsion = repulsion.masked_fill(mask, 0.0)
                 
                 # 累加每个样本在当前帧的排斥损失
-                loss_div_batch += repulsion.sum(dim=(1, 2))
-                
+                loss_div_batch += repulsion.sum(dim=(1, 2)) / N
+
             loss_div = loss_div_batch.mean()
             extra_losses["loss_div"] = loss_div
 
@@ -431,5 +437,12 @@ class VideoLLaMA2Trainer(Trainer):
             gamma_3 = getattr(self.args, "gamma_3", 0.3)
             
             total_loss += (gamma_1 * loss_cor) + (gamma_2 * loss_cyc) + (gamma_3 * loss_div)
+            self.log({
+                "loss_ce": task_loss.detach().item(),
+                "loss_cor": loss_cor.detach().item(),
+                "loss_cyc": loss_cyc.detach().item(),
+                "loss_div": loss_div.detach().item(),
+            })
+            print(f"[Tracer] loss_ce={task_loss.detach().item():.4f} loss_cor={loss_cor.detach().item():.4f} loss_cyc={loss_cyc.detach().item():.4f} loss_div={loss_div.detach().item():.4f}", flush=True)
 
         return (total_loss, outputs) if return_outputs else total_loss

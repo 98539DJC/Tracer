@@ -75,6 +75,7 @@ class Videollama2Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama2MetaForCausalLM):
         **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        loss_data = None
         if inputs_embeds is None:
             (
                 input_ids,
@@ -122,20 +123,44 @@ class Videollama2Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama2MetaForCausalLM):
                 wordweights = torch.stack(wordweights)
             except ValueError as e:
                 raise 
-            loss_data['wordweights'] = wordweights
+            if loss_data is not None:
+                loss_data['wordweights'] = wordweights
             
         
-        outputs = super().forward(
+        # 手动前向：不用 super().forward，避免 transformers Qwen2ForCausalLM.forward
+        # 里的 `logits = logits.float()` 把 bf16 logits 转回 fp32（显存翻倍、OOM 元凶）。
+        # 这里 logits 保持 bf16。
+        model_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
-            labels=labels,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        hidden_states = model_outputs[0]
+        logits = self.lm_head(hidden_states)
+
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+
+        if return_dict is False:
+            output = (logits,) + model_outputs[1:]
+            outputs = ((loss,) + output) if loss is not None else output
+        else:
+            outputs = CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=model_outputs.past_key_values,
+                hidden_states=model_outputs.hidden_states,
+                attentions=model_outputs.attentions,
+            )
         if loss_data is not None:
             outputs["loss_data"] = loss_data
         return outputs
@@ -158,6 +183,7 @@ class Videollama2Qwen2ForCausalLM(Qwen2ForCausalLM, Videollama2MetaForCausalLM):
                 attention_mask,
                 past_key_values,
                 inputs_embeds,
+                _,
                 _
             ) = self.prepare_inputs_labels_for_multimodal(
                 input_ids=inputs,

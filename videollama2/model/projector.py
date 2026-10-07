@@ -17,11 +17,11 @@ import re
 
 import einops
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.regnet import RegStage
-from timm.models.layers import LayerNorm2d, ConvNormAct, trunc_normal_
-from mambavision.models.mamba_vision import  BiMambaVisionLayer
+from timm.models.layers import LayerNorm2d, trunc_normal_
 from transformers import TRANSFORMERS_CACHE
 import math
 
@@ -117,7 +117,7 @@ def build_vision_projector(config, delay_load=False, **kwargs):
         return SpatialConv(config)
     elif projector_type == "spatial_pool":
         return SpatialPool(config)
-    elif projector_type == "tracer":
+    elif projector_type == "tracer" or projector_type == "route_mamba":
         return TracerMambaConnector(config)
     if projector_type == 'identity':
         return IdentityMap()
@@ -311,16 +311,16 @@ class NeuralTrajectoryEvolution(nn.Module):
         # 1. 局部连续搜索网格采样 (Bilinear)
         grid = self._get_neighborhood_grid(pos_t, H, W) # (B, N, K, 2)
         K = grid.shape[2]
-        grid_for_sample = grid.view(B, N, K, 2)
+        grid_for_sample = grid.view(B, N, K, 2).to(X_v_next.dtype)
         
-        # v_next_raw: (B, D, N, K) -> (B, N, K, D)
-        v_next_raw = F.grid_sample(X_v_next, grid_for_sample, mode='bilinear', padding_mode='border', align_corners=True)
-        v_next_raw = v_next_raw.permute(0, 2, 3, 1)
         
         # 2. Attention
         q = self.W_Q(x_t).unsqueeze(2) # (B, N, 1, D)
-        k = self.W_K(v_next_raw)       # (B, N, K, D)
-        v = self.W_V(v_next_raw)       # (B, N, K, D)
+        Xv_flat = X_v_next.permute(0, 2, 3, 1).reshape(-1, self.d)
+        K_map = self.W_K(Xv_flat).reshape(B, H,W, self.d).permute(0, 3, 1, 2)
+        V_map = self.W_V(Xv_flat).reshape(B, H, W, self.d).permute(0, 3, 1, 2)
+        k = F.grid_sample(K_map, grid_for_sample, mode="bilinear",padding_mode="border", align_corners=True).permute(0, 2, 3, 1)
+        v = F.grid_sample(V_map, grid_for_sample, mode="bilinear", padding_mode="border",align_corners=True).permute(0, 2, 3, 1)
         
         attn = F.softmax((q @ k.transpose(-1, -2)) / (self.d ** 0.5), dim=-1) # (B, N, 1, K)
         x_t_next_evolved = (attn @ v).squeeze(2) # (B, N, D)
@@ -334,10 +334,10 @@ class NeuralTrajectoryEvolution(nn.Module):
         c_t_next = torch.sigmoid(self.beta * c_t + (1 - self.beta) * sim_score)
         
         # 产生 Reset Indicator
-        i_t_next = (c_t_next < self.tau).float()
+        i_t_next = (c_t_next < self.tau).to(self.W_Q.weight.dtype)
         
         # 发生断点时原地重采样特征复位
-        resample_grid = self._get_neighborhood_grid(pos_t_next, H, W)[:, :, 0, :].unsqueeze(2) # (B, N, 1, 2)
+        resample_grid = self._get_neighborhood_grid(pos_t_next, H, W)[:, :, 60, :].unsqueeze(2).to(X_v_next.dtype) # (B, N, 1, 2)
         reset_feat = F.grid_sample(X_v_next, resample_grid, mode='bilinear', align_corners=True)
         reset_feat = reset_feat.permute(0, 2, 3, 1).squeeze(2) # (B, N, D)
         
@@ -353,6 +353,7 @@ class NeuralTrajectoryEvolution(nn.Module):
         B, T, D, H, W = X_v.shape
         N = H * W
         device = X_v.device
+        X_v = X_v.to(self.W_Q.weight.dtype)
         
         time_steps = list(range(T))
         if reverse:
@@ -363,17 +364,17 @@ class NeuralTrajectoryEvolution(nn.Module):
         # 0时刻初始化
         if pos_init is None:
             grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-            pos_t = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1).unsqueeze(0).expand(B, N, 2).float()
+            pos_t = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1).unsqueeze(0).expand(B, N, 2).to(self.W_Q.weight.dtype)
         else:
             pos_t = pos_init
             
         t0 = time_steps[0]
         # 获取初始帧特征
-        grid_0 = self._get_neighborhood_grid(pos_t, H, W)[:, :, 0, :].unsqueeze(2)
+        grid_0 = self._get_neighborhood_grid(pos_t, H, W)[:, :, 60, :].unsqueeze(2).to(X_v[:, t0].dtype)
         x_t = F.grid_sample(X_v[:, t0], grid_0, mode='bilinear', align_corners=True).permute(0, 2, 3, 1).squeeze(2)
         
-        c_t = torch.ones(B, N, 1, device=device)
-        i_t = torch.zeros(B, N, 1, device=device)
+        c_t = torch.ones(B, N, 1, device=device, dtype=self.W_Q.weight.dtype)
+        i_t = torch.zeros(B, N, 1, device=device, dtype=self.W_Q.weight.dtype)
         
         x_seq.append(x_t)
         pos_seq.append(pos_t)
@@ -383,7 +384,9 @@ class NeuralTrajectoryEvolution(nn.Module):
         # 时序演化
         for t in time_steps[1:]:
             X_v_next = X_v[:, t]
-            x_t, pos_t, c_t, i_t = self._step_evolution(x_t, pos_t, c_t, X_v_next)
+            x_t, pos_t, c_t, i_t = torch.utils.checkpoint.checkpoint(
+                self._step_evolution, x_t, pos_t, c_t, X_v_next, use_reentrant=False
+            )
             x_seq.append(x_t)
             pos_seq.append(pos_t)
             c_seq.append(c_t)
@@ -415,8 +418,15 @@ class TracerMambaConnector(STCConnectorV35):
         
         # 1. 挂载 NTE (Neural Trajectory Evolution)
         self.nte = NeuralTrajectoryEvolution(d_model=dim)
+        self.nte.apply(self._init_weights)
+        # 位置/置信度预测层：W_pos 用小方差让初始位移为 sub-pixel（避免漂移出图，又不落入"不动"平凡解使 loss_cyc 恒 0）；W_sim 零初始化让 fidelity 初始稳定
+        nn.init.normal_(self.nte.W_pos.weight, std=1e-3)
+        nn.init.zeros_(self.nte.W_pos.bias)
+        nn.init.zeros_(self.nte.W_sim.weight)
+        nn.init.zeros_(self.nte.W_sim.bias)
         
-        # 2. 构建BCM的 MambaVisionLayer 网络 
+        # 2. 构建BCM的 MambaVisionLayer 网络
+        from mambavision.models.mamba_vision import BiMambaVisionLayer
         total_blocks = max(1, mv_stages * mv_depth)
         dpr_all = [drop_path * i / (total_blocks - 1) if total_blocks > 1 else 0.0 for i in range(total_blocks)]
 
@@ -462,7 +472,12 @@ class TracerMambaConnector(STCConnectorV35):
             x = einops.rearrange(x, "b t (h w) d -> b d t h w", h=hw, w=hw)
         elif x.ndim == 5:
             x = einops.rearrange(x, "b t h w d -> b d t h w")
-        
+
+        # 先用 s1 (RegStage) 把视觉特征维度 (mm_hidden_size) 映射到 LLM hidden size
+        x = einops.rearrange(x, "b d t h w -> (b t) d h w")
+        x = self.s1(x)
+        x = einops.rearrange(x, "(b t) d h w -> b d t h w", t=t)
+
         B,D,T,H,W = x.shape
         X_v = einops.rearrange(x, "b d t h w -> b t d h w")
         
@@ -483,14 +498,13 @@ class TracerMambaConnector(STCConnectorV35):
         }
         
         # (3) BCM 建模 (MambaVision)
-        # 恢复回 MambaVisionLayer 习惯的 spatial batch 并行结构 (b*t, d, h, w)
+        # BiMambaVisionLayer 期望 5D 输入 (b, t, d, h, w)
         # 注意：此处 x_fwd 的 N 维度本质上是展平的 H*W
         x_mamba_in = einops.rearrange(x_fwd, "b (h w) t d -> b t d h w", h=H, w=W)
-        self.m1(x_mamba_in)
-        x_mamba_out = x_mamba_in 
-        
+        x_mamba_out = torch.utils.checkpoint.checkpoint(self.m1, x_mamba_in, use_reentrant=False)
+
         # (4) 展平成 [B, N_seq, D] 进入 LLM Projector
-        x_out = einops.rearrange(x_mamba_out, "(b t) d h w -> b (t h w) d", t=T)
+        x_out = einops.rearrange(x_mamba_out, "b t d h w -> b (t h w) d")
         x_out = self.readout(x_out)
         
         return x_out, loss_data

@@ -317,6 +317,41 @@ class ConvBlock(nn.Module):
         return x
 
 
+def selective_scan_ref(u, delta, A, B, C, D=None, delta_bias=None, delta_softplus=False):
+    """纯 PyTorch 的 selective scan 参考实现，数值稳定（fp32 累加）。
+
+    u: (batch, dim, L)
+    delta: (batch, dim, L)
+    A: (dim, dstate)
+    B: (batch, dstate, L)
+    C: (batch, dstate, L)
+    D: (dim,)
+    """
+    dtype_in = u.dtype
+    u = u.float()
+    delta = delta.float()
+    if delta_bias is not None:
+        delta = delta + delta_bias[..., None].float()
+    if delta_softplus:
+        delta = F.softplus(delta)
+    batch, dim, L = u.shape
+    dstate = A.shape[1]
+    B = B.float()
+    C = C.float()
+    A = A.float()
+    x = torch.zeros((batch, dim, dstate), device=u.device, dtype=torch.float32)
+    deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
+    deltaB_u = torch.einsum('bdl,bnl,bdl->bdln', delta, B, u)
+    ys = []
+    for i in range(L):
+        x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+        y = torch.einsum('bdn,bn->bd', x, C[:, :, i])
+        ys.append(y)
+    y = torch.stack(ys, dim=2)
+    out = y if D is None else y + u * D.float().view(1, -1, 1)
+    return out.to(dtype=dtype_in)
+
+
 class MambaVisionMixer(nn.Module):
     def __init__(
         self,
@@ -412,16 +447,9 @@ class MambaVisionMixer(nn.Module):
         dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen)
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        y = selective_scan_fn(x, 
-                              dt, 
-                              A, 
-                              B, 
-                              C, 
-                              self.D.float(), 
-                              z=None, 
-                              delta_bias=self.dt_proj.bias.float(), 
-                              delta_softplus=True, 
-                              return_last_state=None)
+        y = selective_scan_fn(x, dt, A, B, C, self.D.float(),
+                              delta_bias=self.dt_proj.bias.float(),
+                              delta_softplus=True)
         
         y = torch.cat([y, z], dim=1)
         y = rearrange(y, "b d l -> b l d")
@@ -606,7 +634,7 @@ class MambaVisionLayer(nn.Module):
             pad_r = (self.window_size - W % self.window_size) % self.window_size
             pad_b = (self.window_size - H % self.window_size) % self.window_size
             if pad_r > 0 or pad_b > 0:
-                x = torch.nn.functional.pad(x, (0,pad_r,0,pad_b))
+                x = torch.nn.functional.pad(x, (0,pad_r,0,pad_b), mode='reflect')
                 _, _, Hp, Wp = x.shape
             else:
                 Hp, Wp = H, W
