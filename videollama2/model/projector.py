@@ -403,7 +403,24 @@ class NeuralTrajectoryEvolution(nn.Module):
         return x_out, pos_out, c_out, i_out
 
 
-class TracerMambaConnector(STCConnectorV35): 
+class SpatialTrajectoryEvolution(nn.Module):
+    """空间轨迹演化 STE：以时间帧为锚点，沿行优先(raster)做全局空间扫描，
+    产出空间优先 token，与 NTE 的时间优先 token 对偶。"""
+    def __init__(self, d_model):
+        super().__init__()
+        self.d = d_model
+        from mambavision.models.mamba_vision import MambaVisionMixer
+        self.norm = nn.LayerNorm(d_model)
+        self.scan = MambaVisionMixer(d_model=d_model, d_state=8, d_conv=3, expand=1)
+
+    def forward(self, X_v):                       # (B, T, D, H, W)
+        B, T, D, H, W = X_v.shape
+        x = X_v.permute(0, 1, 3, 4, 2).reshape(B * T, H * W, D)  # 每帧展平成 729 空间序列
+        x = self.scan(self.norm(x)) + x           # 全局空间扫描 + 残差
+        return x.reshape(B, T, H * W, D)          # (B, T, N, D)
+
+
+class TracerMambaConnector(STCConnectorV35):
     """
     整合了 NTE,ATD和BCM的端到端 Tracer。
     不计算 Loss，而是将所需的所有追踪状态作为 loss_data 输出。
@@ -424,7 +441,11 @@ class TracerMambaConnector(STCConnectorV35):
         nn.init.zeros_(self.nte.W_pos.bias)
         nn.init.zeros_(self.nte.W_sim.weight)
         nn.init.zeros_(self.nte.W_sim.bias)
-        
+
+        # 1.5 挂载 STE (Spatial Trajectory Evolution，空间轨迹演化)
+        self.ste = SpatialTrajectoryEvolution(d_model=dim)
+        self.ste.apply(self._init_weights)
+
         # 2. 构建BCM的 MambaVisionLayer 网络
         from mambavision.models.mamba_vision import BiMambaVisionLayer
         total_blocks = max(1, mv_stages * mv_depth)
@@ -483,7 +504,11 @@ class TracerMambaConnector(STCConnectorV35):
         
         # (1) Neural Trajectory Evolution (前向)
         x_fwd, pos_fwd, c_fwd, i_fwd = self.nte(X_v, reverse=False)
-        
+
+        # (1.5) Spatial Trajectory Evolution (空间轨迹，与时间轨迹对偶)
+        x_spatial = torch.utils.checkpoint.checkpoint(self.ste, X_v, use_reentrant=False)
+        x_fwd = x_fwd + x_spatial.transpose(1, 2)   # (B, N, T, D) 相加融合
+
         # (2) Neural Trajectory Evolution (后向循环，用于 Cycle-Consistency)
         pos_init_bwd = pos_fwd[:, :, -1, :].detach() 
         _, pos_bwd, _, _ = self.nte(X_v, reverse=True, pos_init=pos_init_bwd)
