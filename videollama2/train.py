@@ -38,8 +38,16 @@ from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 import sys
 sys.path.append('./')
 from videollama2.model import *
-from accelerate.utils.deepspeed import  DeepSpeedEngineWrapper
-DeepSpeedEngineWrapper.backward=lambda self,loss,**kwargs:self.engine.backward(loss,**kwargs)
+from accelerate.utils.deepspeed import DeepSpeedEngineWrapper
+def _ds_backward(self, loss, **kw):
+    self.engine.backward(loss, **kw)
+    flag = self.engine.inside_no_sync_ctxt
+    self.engine.inside_no_sync_ctxt = False
+    try:
+        self.engine.step()
+    finally:
+        self.engine.inside_no_sync_ctxt = flag
+DeepSpeedEngineWrapper.backward = _ds_backward
 from videollama2.constants import NUM_FRAMES, IGNORE_INDEX, MODAL_INDEX_MAP
 from videollama2.mm_utils import tokenizer_multimodal_token, process_video, process_image
 from videollama2.videollama2_trainer import (VideoLLaMA2Trainer,
@@ -631,7 +639,7 @@ def train(attn_implementation=None):
             _shapes = [tuple(p.shape) for p in _pg['params'][:2]]
             print(f'[OPTIM] group {_i}: lr={_pg["lr"]:.3e} n={len(_pg["params"])} numel={_numel} shapes={_shapes}', flush=True)
         for _n, _p in model.named_parameters():
-            if 'mm_projector' in _n and 'W_sim' in _n:
+            if ('mm_projector' in _n and 'W_sim' in _n) or 'lora_B' in _n:
                 print(f'[WEIGHT] {_n}: max={_p.detach().float().abs().max().item():.3e}', flush=True)
     trainer.save_state()    # 保存训练状态
 
