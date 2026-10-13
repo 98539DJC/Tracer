@@ -1,0 +1,95 @@
+import os
+import sys
+import json
+import torch
+sys.path.append('./')
+from functools import partial
+from peft import PeftModel
+from videollama2 import mm_infer
+from videollama2.utils import disable_torch_init
+from videollama2.mm_utils import process_image, process_video
+from transformers import AutoTokenizer, AutoConfig
+from videollama2.model.videollama2_qwen2 import Videollama2Qwen2ForCausalLM
+
+disable_torch_init()
+
+dataset = 'MSVD'
+split = 'test'
+folder = 'my_run_qlora_v7'
+ckpt_id = 200
+chunk_idx = int(sys.argv[1])
+num_chunks = int(sys.argv[2])
+
+video_dir = 'datasets/MSVD_sft/videos/'
+video_ext = '.avi'
+valid_jsonl_path = f'datasets/MSVD_sft/make_sft/{split}.jsonl'
+lora_model_path = f'output/{dataset}/checkpoints/{folder}/checkpoint-{ckpt_id}'
+output_path = f'output/{dataset}/result/{folder}-{ckpt_id}_{split}_chunk{chunk_idx}.json'
+
+modal = 'video'
+instruct = 'Use only one short sentence to describe the video.'
+model_path = 'DAMO-NLP-SG/VideoLLaMA2.1-7B-16F'
+
+config = AutoConfig.from_pretrained(model_path)
+config.mm_projector_type = 'route_mamba'
+model = Videollama2Qwen2ForCausalLM.from_pretrained(
+    model_path,
+    config=config, torch_dtype=torch.bfloat16
+)
+model = model.to('cuda')
+
+non_lora_trainables = torch.load(
+    os.path.join(lora_model_path, 'non_lora_trainables.bin'),
+    map_location='cpu'
+)
+non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
+if any(k.startswith('model.model.') for k in non_lora_trainables):
+    non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
+model.load_state_dict(non_lora_trainables, strict=False)
+
+print('Loading LoRA weights...')
+model = PeftModel.from_pretrained(model, lora_model_path)
+print('Merging LoRA weights...')
+model = model.merge_and_unload()
+print('Model loaded.')
+
+vision_tower = model.get_vision_tower()
+processor = vision_tower.image_processor
+processor = {
+    'image': partial(process_image, processor=processor, aspect_ratio=None),
+    'video': partial(process_video, processor=processor, aspect_ratio='pad', num_frames=16),
+}
+tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+if tokenizer.pad_token is None and tokenizer.unk_token is not None:
+    tokenizer.pad_token = tokenizer.unk_token
+
+lines = open(valid_jsonl_path, encoding='utf8').readlines()
+chunk_lines = lines[chunk_idx::num_chunks]
+
+output_list = []
+for line in chunk_lines:
+    data = json.loads(line)
+    video_id = data["video_id"]
+    video_path = video_dir + video_id + video_ext
+    try:
+        output = mm_infer(
+            processor[modal](video_path), instruct,
+            model=model, tokenizer=tokenizer, do_sample=False, modal=modal
+        )
+        output = output.lower().rstrip('.')
+    except Exception as e:
+        print(f"Error {video_id}: {e}")
+        output = ""
+    output_dict = {
+        "split": split,
+        "image_name": video_path,
+        "captions": data["golden_captions"],
+        "prediction": output,
+    }
+    print(f"[chunk{chunk_idx}] {video_id}: {output}")
+    output_list.append(output_dict)
+
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+with open(output_path, 'w', encoding='utf-8') as f:
+    json.dump(output_list, f, indent=4, ensure_ascii=False)
+print(f"chunk{chunk_idx} done, {len(output_list)} items -> {output_path}")

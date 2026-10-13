@@ -24,6 +24,8 @@ from .projector import load_mm_projector, build_vision_projector
 from .encoder import build_vision_tower
 from ..constants import IGNORE_INDEX, NUM_FRAMES, MODAL_INDEX_MAP
 
+_MEM_DEBUG = os.environ.get('TRACER_MEM_DEBUG', '0') == '1'
+
 
 class Videollama2MetaModel:
 
@@ -129,10 +131,14 @@ class Videollama2MetaForCausalLM(ABC):
 
         frames = einops.rearrange(data_batch, 'b t c h w -> (b t) c h w')
         frames_features = self.get_model().get_vision_tower()(frames)
+        if _MEM_DEBUG:
+            print(f'[MEMDBG] after vision_tower: {torch.cuda.memory_allocated()/1e9:.2f}GB', flush=True)
         frames_features = einops.rearrange(frames_features, '(b t) n h -> b t n h', b = batch_size)
 
         # 【修改点 1】: 兼容返回 tuple 的情况
         agg_output = self.temporal_aggregator(frames_features)
+        if _MEM_DEBUG:
+            print(f'[MEMDBG] after projector: {torch.cuda.memory_allocated()/1e9:.2f}GB', flush=True)
         if isinstance(agg_output, tuple):
             return agg_output # 返回 (video_features, loss_data)
         else:

@@ -63,7 +63,7 @@ class VideoCaptionEvaluator:
         # 加载模型
         config = AutoConfig.from_pretrained(model_path)
         # 更换mm_projector
-        # config.mm_projector_type = 'route_mamba'
+        config.mm_projector_type = 'route_mamba'
         model = Videollama2Qwen2ForCausalLM.from_pretrained(
             model_path, low_cpu_mem_usage=True,
             config=config, device_map='auto', torch_dtype=torch.float16
@@ -167,14 +167,14 @@ class VideoCaptionEvaluator:
 def main():
     # 在这里修改数据集和分割
     dataset = 'MSVD'  # 可选: 'MSVD', 'MSRVTT'
-    split = 'valid'    # 可选: 'valid', 'test'
-    folder = 'baseline'
+    split = 'test'    # 可选: 'valid', 'test'
+    folder = 'my_run_qlora'
     
     # 初始化评估器
     evaluator = VideoCaptionEvaluator()
     
     # 获取checkpoint序号
-    checkpoint_numbers = evaluator.get_checkpoint_numbers(dataset, folder)
+    checkpoint_numbers = [350]
     print(f"找到的checkpoint序号: {checkpoint_numbers}")
     
     if not checkpoint_numbers:

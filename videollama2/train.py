@@ -38,6 +38,25 @@ from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 import sys
 sys.path.append('./')
 from videollama2.model import *
+from accelerate.utils.deepspeed import DeepSpeedEngineWrapper
+def _ds_backward(self, loss, **kw):
+    self.engine.backward(loss, **kw)
+    flag = self.engine.inside_no_sync_ctxt
+    self.engine.inside_no_sync_ctxt = False
+    try:
+        self.engine.step()
+    finally:
+        self.engine.inside_no_sync_ctxt = flag
+DeepSpeedEngineWrapper.backward = _ds_backward
+
+# stage-2 梯度切分与 no_sync 冲突：HF Trainer 梯度累积会在非边界 microbatch 调 no_sync，
+# 而 deepspeed 的 no_sync 断言 stage-2 不允许。patch 成空操作，让梯度正常 allreduce。
+import contextlib
+from deepspeed.runtime.engine import DeepSpeedEngine
+@contextlib.contextmanager
+def _no_sync_null(self):
+    yield
+DeepSpeedEngine.no_sync = _no_sync_null
 from videollama2.constants import NUM_FRAMES, IGNORE_INDEX, MODAL_INDEX_MAP
 from videollama2.mm_utils import tokenizer_multimodal_token, process_video, process_image
 from videollama2.videollama2_trainer import (VideoLLaMA2Trainer,
@@ -256,6 +275,15 @@ class LazySupervisedDataset(Dataset):
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
+        # 预建 video -> 排序条目 映射，避免 __getitem__ 里 O(N) 线性扫描
+        _video_entries = {}
+        for _entry in list_data_dict:
+            if 'video' in _entry:
+                _video_entries.setdefault(_entry['video'], []).append(_entry)
+        self._video_to_entries = {
+            _v: sorted(_es, key=lambda x: x['id'])
+            for _v, _es in _video_entries.items()
+        }
 
     def __len__(self):
         return len(self.list_data_dict)
@@ -341,10 +369,8 @@ class LazySupervisedDataset(Dataset):
             current_entry = self.list_data_dict[i]
             video_path = current_entry['video']
             video_id = video_path.split('/')[-1].split(".")[0]
-            # 筛选出相同video的所有条目
-            same_video_entries = [entry for entry in self.list_data_dict if entry['video'] == video_path]
-            # 按'id'排序
-            sorted_entries = sorted(same_video_entries, key=lambda x: x['id'])
+            # 筛选出相同video的所有条目（预建缓存，O(1)）
+            sorted_entries = self._video_to_entries[video_path]
             # 找到当前条目在排序后的列表中的索引
             gt_id = sorted_entries.index(current_entry)               
             
@@ -471,6 +497,7 @@ def train(attn_implementation=None):
     )
     # 因为vision_tower也会参与qlora,先删除后面再初始化
     del model.model.vision_tower
+    del model.model.mm_projector
     model.config.use_cache = False      # 训练时禁用缓存以获得更优显存使用
 
     # 冻结主干网络参数(当需要微调部分模块时使用)
@@ -492,6 +519,13 @@ def train(attn_implementation=None):
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+        # 诊断：确认 LLM gradient checkpointing 是否真正生效
+        if training_args.local_rank in [-1, 0]:
+            try:
+                print(f'[MEM] model.is_gradient_checkpointing = {model.is_gradient_checkpointing}', flush=True)
+                print(f'[MEM] model.model.gradient_checkpointing = {model.model.gradient_checkpointing}', flush=True)
+            except Exception as e:
+                print(f'[MEM] 查询 is_gradient_checkpointing 失败: {e}', flush=True)
 
     # LoRA适配器配置
     if training_args.lora_enable:
@@ -597,11 +631,50 @@ def train(attn_implementation=None):
     
     # 初始化训练器
     trainer = VideoLLaMA2Trainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    # ---- 诊断：hook 投影器 W_sim 梯度 ----
+    if training_args.local_rank in [-1, 0]:
+        def _grad_hook(name):
+            def _h(grad):
+                if grad is None:
+                    print(f'[GRAD] {name}: None', flush=True)
+                else:
+                    print(f'[GRAD] {name}: {grad.detach().float().norm().item():.3e}', flush=True)
+            return _h
+        for _n, _p in model.named_parameters():
+            if 'mm_projector' in _n and 'W_sim' in _n and _p.requires_grad:
+                _p.register_hook(_grad_hook(_n))
+        print('[HOOK] registered W_sim grad hooks', flush=True)
     # 检查是否存在ckpt并恢复训练
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+    if training_args.local_rank in [-1, 0]:
+        for _i, _pg in enumerate(trainer.optimizer.param_groups):
+            _numel = sum(p.numel() for p in _pg['params'])
+            _shapes = [tuple(p.shape) for p in _pg['params'][:2]]
+            print(f'[OPTIM] group {_i}: lr={_pg["lr"]:.3e} n={len(_pg["params"])} numel={_numel} shapes={_shapes}', flush=True)
+        for _n, _p in model.named_parameters():
+            if ('mm_projector' in _n and 'W_sim' in _n) or 'lora_B' in _n:
+                print(f'[WEIGHT] {_n}: max={_p.detach().float().abs().max().item():.3e}', flush=True)
+        torch.cuda.synchronize()
+        print('[MEMSTAT] allocated=%.2fGB reserved=%.2fGB max_alloc=%.2fGB' % (
+            torch.cuda.memory_allocated()/1e9,
+            torch.cuda.memory_reserved()/1e9,
+            torch.cuda.max_memory_allocated()/1e9), flush=True)
+        try:
+            snap = torch.cuda.memory_snapshot()
+            blocks = []
+            for seg in snap:
+                for b in seg.get('blocks', []):
+                    sz = b.get('size', 0)
+                    if sz and sz > 50 * 1024 * 1024:
+                        blocks.append((sz, b.get('state', '?')))
+            blocks.sort(key=lambda x: -x[0])
+            for sz, st in blocks[:20]:
+                print(f'[MEMSTAT] block {sz/1e9:.3f}GB state={st}', flush=True)
+        except Exception as e:
+            print(f'[MEMSTAT] snapshot failed: {e}', flush=True)
     trainer.save_state()    # 保存训练状态
 
     model.config.use_cache = True   # 推理时启用缓存
