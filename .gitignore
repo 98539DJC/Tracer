@@ -8,6 +8,8 @@ dist
 *.log
 *.log.*
 *.json
+!scripts/zero2.json
+!scripts/zero3.json
 *.jsonl
 log_dir*/
 temp*/
@@ -49,9 +51,11 @@ checkpoints/
 work_dirs*/
 
 # evaluation folder
-/eval
-/eval*
-evaluation/
+/eval/
+evaluation/*
+!evaluation/__init__.py
+!evaluation/official_metrics.py
+!evaluation/pycocoevalcap/
 
 # pretrained weights
 pretrained/
@@ -60,6 +64,26 @@ public_models/
 DAMO-NLP-SG/
 google/
 Qwen/
+DAMO-NLP-SG
+google
+Qwen
 
 # assets
 assets/
+
+# model weights / checkpoints
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.pkl
+*.p
+*.tar.gz
+
+# paper / misc generated
+*.pdf
+tracer_paper*.txt
+
+# backup files
+*.bak
+*.before_ste

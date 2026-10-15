@@ -343,3 +343,52 @@ class KeywordsStoppingCriteria(StoppingCriteria):
         for i in range(output_ids.shape[0]):
             outputs.append(self.call_for_batch(output_ids[i].unsqueeze(0), scores))
         return all(outputs)
+
+# ---------------------------------------------------------------------------
+# Cached video features (used when the SigLIP vision tower is disabled)
+# ---------------------------------------------------------------------------
+# Files hold SigLIP patch features of shape (T, N, H) -- for MSVD, 32 uniformly
+# sampled candidate frames of 729 patches x 1152 dims: (32, 729, 1152).  They
+# are stored as uint16-packed bfloat16: half the size of float32 and
+# bit-identical to what the vision tower produced (bfloat16 -> float32 is
+# lossless).
+
+FEATURE_FILE_SUFFIX = '.npy'
+
+
+def pack_bf16(tensor):
+    """bfloat16 torch tensor -> uint16 numpy array (bit preserving)."""
+    t = tensor.detach().to('cpu', dtype=torch.bfloat16).contiguous()
+    return t.view(torch.uint16).numpy()
+
+
+def unpack_bf16(array):
+    """uint16 numpy array -> bfloat16 torch tensor (bit preserving)."""
+    arr = np.ascontiguousarray(array)
+    if not arr.flags.writeable:      # memory-mapped files are read-only
+        arr = arr.copy()
+    return torch.from_numpy(arr).view(torch.bfloat16)
+
+
+def save_video_features(path, features):
+    """Persist a (T, N, H) feature tensor to `path` as uint16-packed bfloat16."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    np.save(path, pack_bf16(features))
+
+
+def load_video_features(path, indices=None, mmap=True):
+    """Load cached features written by :func:`save_video_features`.
+
+    Args:
+        path: ``.npy`` file holding (T, N, H) uint16-packed bfloat16.
+        indices: optional frame indices (e.g. the keyframe selection).
+        mmap: memory-map so only the selected frames are paged in.
+    Returns:
+        bfloat16 tensor of shape (T, N, H) or (len(indices), N, H).
+    """
+    array = np.load(path, mmap_mode='r' if mmap else None)
+    if indices is not None:
+        array = array[np.asarray(indices, dtype=np.int64)]
+    return unpack_bf16(array)

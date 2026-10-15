@@ -24,6 +24,8 @@ from .projector import load_mm_projector, build_vision_projector
 from .encoder import build_vision_tower
 from ..constants import IGNORE_INDEX, NUM_FRAMES, MODAL_INDEX_MAP
 
+_MEM_DEBUG = os.environ.get('TRACER_MEM_DEBUG', '0') == '1'
+
 
 class Videollama2MetaModel:
 
@@ -42,6 +44,14 @@ class Videollama2MetaModel:
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
+        # When video features are cached offline the SigLIP tower must never be
+        # built, regardless of what --vision_tower says.
+        if getattr(self.config, 'use_precomputed_features', False):
+            vision_tower = 'precomputed'
+            try:
+                model_args.vision_tower = 'precomputed'
+            except Exception:
+                pass
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
         pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
@@ -75,6 +85,10 @@ class Videollama2MetaModel:
                 p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
+            _llm_src = os.path.realpath(getattr(model_args, 'model_path', '') or '')
+            _proj_raw = pretrain_mm_mlp_adapter
+            _proj_src = os.path.realpath(_proj_raw)
+
             if os.path.exists(pretrain_mm_mlp_adapter):
                 is_local = True
                 if os.path.isdir(pretrain_mm_mlp_adapter):
@@ -82,18 +96,50 @@ class Videollama2MetaModel:
                 else:
                     mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             else:
-                # Support loading projector weights from remote HuggingFace model hub
-                is_local = False
-                pretrain_mm_mlp_adapter = pretrain_mm_mlp_adapter.replace('mm_projector.bin', '')
-                pretrain_mm_mlp_adapter = pretrain_mm_mlp_adapter.strip('/').strip('\\').strip()
-                mm_projector_weights = load_mm_projector(pretrain_mm_mlp_adapter)
+                # The projector weights are a REQUIRED, explicitly given local file.
+                # Silently falling back to a Hub-cache lookup hides a bad path (and with
+                # HF_HUB_OFFLINE=1 it cannot work at all), so fail loudly instead.
+                raise FileNotFoundError(
+                    '[PROJ] projector weights not found: %s (resolved: %s).\n'
+                    '       Pass an existing path, e.g. '
+                    '--pretrain_mm_mlp_adapter '
+                    'DAMO-NLP-SG/VideoLLaMA2.1-7B-16F-Base/mm_projector.bin, '
+                    'and make sure DAMO-NLP-SG is linked into the project root.'
+                    % (_proj_raw, _proj_src))
+
+            # LLM and projector must come from DIFFERENT checkpoints.  If the projector
+            # file sits inside the LLM checkpoint dir we would be loading the full
+            # model's own projector, silently defeating the Base initialisation.
+            if _llm_src and _proj_src.startswith(_llm_src.rstrip(os.sep) + os.sep):
+                raise RuntimeError(
+                    '[PROJ] refusing to start: the projector weights (%s) live inside '
+                    'the LLM checkpoint (%s).\n'
+                    '       Qwen2 must come from .../VideoLLaMA2.1-7B-16F and the '
+                    'projector from .../VideoLLaMA2.1-7B-16F-Base/mm_projector.bin.'
+                    % (_proj_src, _llm_src))
 
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
             # self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
             # set strict=False to avoid missing key error regarding bert.embeddings.position_ids
-            self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'), strict=False)
+            _proj_sd = get_w(mm_projector_weights, 'mm_projector')
+            _load_ret = self.mm_projector.load_state_dict(_proj_sd, strict=False)
+            if int(os.environ.get('LOCAL_RANK', 0)) == 0:
+                _own = sorted({k.split('.')[0] for k in self.mm_projector.state_dict()})
+                _from_ckpt = sorted({k.split('.')[0] for k in _proj_sd})
+                _kept = [m for m in _own if m not in _from_ckpt]
+                print('[PROJ] LLM        <- %s' % (_llm_src or getattr(model_args, 'model_path', '?')),
+                      flush=True)
+                print('[PROJ] projector  <- %s  (local=%s)' % (_proj_src, is_local), flush=True)
+                print('[PROJ] loaded %d/%d tensors into %s | missing=%d unexpected=%d'
+                      % (len(_proj_sd), len(self.mm_projector.state_dict()),
+                         type(self.mm_projector).__name__,
+                         len(_load_ret.missing_keys), len(_load_ret.unexpected_keys)),
+                      flush=True)
+                print('[PROJ] modules taken from the projector checkpoint: %s' % _from_ckpt, flush=True)
+                print('[PROJ] modules kept at their own init (not in that checkpoint): %s'
+                      % _kept, flush=True)
 
 
 class Videollama2MetaForCausalLM(ABC):
@@ -114,25 +160,50 @@ class Videollama2MetaForCausalLM(ABC):
     def encode_images_or_videos(self, images):
         num_frames = self.config.num_frames if hasattr(self.config, 'num_frames') else NUM_FRAMES
 
-        data_batch = []
-        for i, (data, modal) in enumerate(images):
-            if modal == 'image':
-                data = data.expand(num_frames, -1, -1, -1)
-            else:
-                data = data
-            data_batch.append(data)
+        # ------------------------------------------------------------------
+        # Fast path: features were cached offline, so the vision tower is
+        # skipped entirely.  The dataset then yields (t, n, h) tensors instead
+        # of (t, c, h, w) pixel tensors.
+        # ------------------------------------------------------------------
+        use_precomputed = bool(getattr(self.config, 'use_precomputed_features', False))
+        if not use_precomputed and len(images) > 0 and images[0][0].dim() == 3:
+            use_precomputed = True  # auto-detect by tensor rank
 
-        data_batch = torch.stack(data_batch, dim=0)
+        if use_precomputed:
+            feat_batch = []
+            for data, modal in images:
+                assert data.dim() == 3, (
+                    'precomputed feature path expects (t, n, h) tensors, got %s'
+                    % (tuple(data.shape),))
+                feat_batch.append(data)
+            frames_features = torch.stack(feat_batch, dim=0)  # (b, t, n, h)
+            if _MEM_DEBUG:
+                print(f'[MEMDBG] precomputed features {tuple(frames_features.shape)} '
+                      f'{frames_features.dtype}', flush=True)
+        else:
+            data_batch = []
+            for i, (data, modal) in enumerate(images):
+                if modal == 'image':
+                    data = data.expand(num_frames, -1, -1, -1)
+                else:
+                    data = data
+                data_batch.append(data)
 
-        assert len(data_batch.size()) == 5
-        batch_size = data_batch.size(0)
+            data_batch = torch.stack(data_batch, dim=0)
 
-        frames = einops.rearrange(data_batch, 'b t c h w -> (b t) c h w')
-        frames_features = self.get_model().get_vision_tower()(frames)
-        frames_features = einops.rearrange(frames_features, '(b t) n h -> b t n h', b = batch_size)
+            assert len(data_batch.size()) == 5
+            batch_size = data_batch.size(0)
+
+            frames = einops.rearrange(data_batch, 'b t c h w -> (b t) c h w')
+            frames_features = self.get_model().get_vision_tower()(frames)
+            if _MEM_DEBUG:
+                print(f'[MEMDBG] after vision_tower: {torch.cuda.memory_allocated()/1e9:.2f}GB', flush=True)
+            frames_features = einops.rearrange(frames_features, '(b t) n h -> b t n h', b = batch_size)
 
         # 【修改点 1】: 兼容返回 tuple 的情况
         agg_output = self.temporal_aggregator(frames_features)
+        if _MEM_DEBUG:
+            print(f'[MEMDBG] after projector: {torch.cuda.memory_allocated()/1e9:.2f}GB', flush=True)
         if isinstance(agg_output, tuple):
             return agg_output # 返回 (video_features, loss_data)
         else:

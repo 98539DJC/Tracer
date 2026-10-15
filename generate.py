@@ -63,7 +63,14 @@ class VideoCaptionEvaluator:
         # 加载模型
         config = AutoConfig.from_pretrained(model_path)
         # 更换mm_projector
-        # config.mm_projector_type = 'route_mamba'
+        config.mm_projector_type = 'route_mamba'
+
+        # ---- cached SigLIP features: never build or load the vision tower ----
+        FEATURE_DIR = os.environ.get('MSVD_FEATURE_DIR', 'datasets/MSVD_sft/siglip_feat16')
+        USE_FEATURE_CACHE = os.environ.get('USE_FEATURE_CACHE', '1') == '1'
+        if USE_FEATURE_CACHE:
+            config.mm_vision_tower = 'precomputed'
+            config.use_precomputed_features = True
         model = Videollama2Qwen2ForCausalLM.from_pretrained(
             model_path, low_cpu_mem_usage=True,
             config=config, device_map='auto', torch_dtype=torch.float16
@@ -87,12 +94,27 @@ class VideoCaptionEvaluator:
         print('Model is loaded...')
              
         # 处理器和tokenizer
-        vision_tower = model.get_vision_tower()
-        processor = vision_tower.image_processor
-        processor = {
-            'image': partial(process_image, processor=processor, aspect_ratio=None),
-            'video': partial(process_video, processor=processor, aspect_ratio=None, num_frames=16),
-        }
+        if USE_FEATURE_CACHE:
+            from videollama2.mm_utils import load_video_features
+            print(f'[FEAT] reading cached SigLIP features from {FEATURE_DIR} '
+                  f'(built with aspect_ratio=\'pad\'; SigLIP is not loaded)', flush=True)
+
+            def load_input(video_path):
+                vid = os.path.basename(video_path).rsplit('.', 1)[0]
+                feat_path = os.path.join(FEATURE_DIR, vid + '.npy')
+                if not os.path.exists(feat_path):
+                    raise FileNotFoundError(f'feature cache miss: {feat_path}')
+                return load_video_features(feat_path)
+        else:
+            vision_tower = model.get_vision_tower()
+            _image_processor = vision_tower.image_processor
+            processor = {
+                'image': partial(process_image, processor=_image_processor, aspect_ratio=None),
+                'video': partial(process_video, processor=_image_processor, aspect_ratio=None, num_frames=16),
+            }
+
+            def load_input(video_path):
+                return processor[modal](video_path)
         
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         if tokenizer.pad_token is None and tokenizer.unk_token is not None:
@@ -108,7 +130,7 @@ class VideoCaptionEvaluator:
                 
                 try:
                     output = mm_infer(
-                        processor[modal](video_path), instruct, 
+                        load_input(video_path), instruct, 
                         model=model, tokenizer=tokenizer, do_sample=False, modal=modal
                     ) 
                     output = output.lower().rstrip('.')
@@ -167,14 +189,14 @@ class VideoCaptionEvaluator:
 def main():
     # 在这里修改数据集和分割
     dataset = 'MSVD'  # 可选: 'MSVD', 'MSRVTT'
-    split = 'valid'    # 可选: 'valid', 'test'
-    folder = 'baseline'
+    split = 'test'    # 可选: 'valid', 'test'
+    folder = 'my_run_qlora'
     
     # 初始化评估器
     evaluator = VideoCaptionEvaluator()
     
     # 获取checkpoint序号
-    checkpoint_numbers = evaluator.get_checkpoint_numbers(dataset, folder)
+    checkpoint_numbers = [350]
     print(f"找到的checkpoint序号: {checkpoint_numbers}")
     
     if not checkpoint_numbers:

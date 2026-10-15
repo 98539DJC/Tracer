@@ -17,11 +17,11 @@ import re
 
 import einops
 import torch
+import torch.utils.checkpoint
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.regnet import RegStage
-from timm.models.layers import LayerNorm2d, ConvNormAct, trunc_normal_
-from mambavision.models.mamba_vision import  BiMambaVisionLayer
+from timm.models.layers import LayerNorm2d, trunc_normal_
 from transformers import TRANSFORMERS_CACHE
 import math
 
@@ -117,7 +117,7 @@ def build_vision_projector(config, delay_load=False, **kwargs):
         return SpatialConv(config)
     elif projector_type == "spatial_pool":
         return SpatialPool(config)
-    elif projector_type == "tracer":
+    elif projector_type == "tracer" or projector_type == "route_mamba":
         return TracerMambaConnector(config)
     if projector_type == 'identity':
         return IdentityMap()
@@ -256,7 +256,7 @@ class NeuralTrajectoryEvolution(nn.Module):
     """
     NTE:包含连续坐标采样和 ATD 机制
     """
-    def __init__(self, d_model, search_radius=5, beta=0.8, tau=0.3):
+    def __init__(self, d_model, search_radius=5, beta=0.8, tau=0.5):
         super().__init__()
         self.d = d_model
         self.R = search_radius
@@ -273,6 +273,19 @@ class NeuralTrajectoryEvolution(nn.Module):
         
         # Fidelity Gating Estimator -> sim score
         self.W_sim = nn.Linear(self.d, 1)
+
+        # ---- v13: residual attention -------------------------------------
+        # The state is *refined* instead of replaced: x_next = x_t + a*out_proj(attn@v).
+        # out_proj is zero-initialised, so at init x_next == x_t exactly and NTE
+        # starts as the identity; it can only ever add a refinement.
+        self.out_proj = nn.Linear(self.d, self.d)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        # learnable gates / scales, all init 1.0 => v13 starts from the previous
+        # behaviour and training may shrink or grow each path on its own.
+        self.alpha_nte = nn.Parameter(torch.ones(1))   # weight of the attention residual
+        self.pos_gain = nn.Parameter(torch.ones(1))    # saccade step size (grid cells)
+        self.sim_gain = nn.Parameter(torch.ones(1))    # fidelity dynamic range
         
     def _get_neighborhood_grid(self, pos, H, W):
         """
@@ -311,33 +324,46 @@ class NeuralTrajectoryEvolution(nn.Module):
         # 1. 局部连续搜索网格采样 (Bilinear)
         grid = self._get_neighborhood_grid(pos_t, H, W) # (B, N, K, 2)
         K = grid.shape[2]
-        grid_for_sample = grid.view(B, N, K, 2)
+        grid_for_sample = grid.view(B, N, K, 2).to(X_v_next.dtype)
         
-        # v_next_raw: (B, D, N, K) -> (B, N, K, D)
-        v_next_raw = F.grid_sample(X_v_next, grid_for_sample, mode='bilinear', padding_mode='border', align_corners=True)
-        v_next_raw = v_next_raw.permute(0, 2, 3, 1)
         
         # 2. Attention
         q = self.W_Q(x_t).unsqueeze(2) # (B, N, 1, D)
-        k = self.W_K(v_next_raw)       # (B, N, K, D)
-        v = self.W_V(v_next_raw)       # (B, N, K, D)
+        Xv_flat = X_v_next.permute(0, 2, 3, 1).reshape(-1, self.d)
+        K_map = self.W_K(Xv_flat).reshape(B, H,W, self.d).permute(0, 3, 1, 2)
+        V_map = self.W_V(Xv_flat).reshape(B, H, W, self.d).permute(0, 3, 1, 2)
+        k = F.grid_sample(K_map, grid_for_sample, mode="bilinear",padding_mode="border", align_corners=True).permute(0, 2, 3, 1)
+        v = F.grid_sample(V_map, grid_for_sample, mode="bilinear", padding_mode="border",align_corners=True).permute(0, 2, 3, 1)
         
         attn = F.softmax((q @ k.transpose(-1, -2)) / (self.d ** 0.5), dim=-1) # (B, N, 1, K)
-        x_t_next_evolved = (attn @ v).squeeze(2) # (B, N, D)
+        # identity path = the new frame's own feature at the current gaze centre.
+        # With out_proj zero-initialised this makes x_next == that raw feature, so
+        # NTE starts as "local attention as a residual on the frame feature" and the
+        # per-frame temporal structure is preserved.
+        _center = self._get_neighborhood_grid(pos_t, H, W)[:, :, 60, :].unsqueeze(2).to(X_v_next.dtype)
+        x_identity = F.grid_sample(X_v_next, _center, mode='bilinear',
+                                   align_corners=True).permute(0, 2, 3, 1).squeeze(2)
+        x_t_next_evolved = x_identity + self.alpha_nte * self.out_proj((attn @ v).squeeze(2))  # (B, N, D)
         
         # 3. Saccadic Gaze Estimator (位置更新)
-        delta_pos = self.W_pos(torch.cat([x_t_next_evolved, q.squeeze(2)], dim=-1)) # (B, N, 2)
+        delta_pos = self.pos_gain * torch.tanh(
+            self.W_pos(torch.cat([x_t_next_evolved, q.squeeze(2)], dim=-1)))  # (B, N, 2), bounded
         pos_t_next = pos_t + delta_pos
+        pos_t_next = torch.stack([pos_t_next[..., 0].clamp(0, W - 1),
+                                  pos_t_next[..., 1].clamp(0, H - 1)], dim=-1)
         
         # 4. Adaptive Temporal Decoupling (ATD)
-        sim_score = self.W_sim(x_t_next_evolved * x_t) # Element-wise sim
+        # bounded similarity: an unbounded W_sim output saturates the sigmoid below
+        # (measured: s ~ -5.5 drove c to 0.11, so the ATD threshold fired on EVERY
+        # step).  tanh keeps the fidelity in a usable dynamic range instead.
+        sim_score = 3.0 * torch.tanh(self.sim_gain * self.W_sim(x_t_next_evolved * x_t))
         c_t_next = torch.sigmoid(self.beta * c_t + (1 - self.beta) * sim_score)
         
         # 产生 Reset Indicator
-        i_t_next = (c_t_next < self.tau).float()
+        i_t_next = (c_t_next < self.tau).to(self.W_Q.weight.dtype)
         
         # 发生断点时原地重采样特征复位
-        resample_grid = self._get_neighborhood_grid(pos_t_next, H, W)[:, :, 0, :].unsqueeze(2) # (B, N, 1, 2)
+        resample_grid = self._get_neighborhood_grid(pos_t_next, H, W)[:, :, 60, :].unsqueeze(2).to(X_v_next.dtype) # (B, N, 1, 2)
         reset_feat = F.grid_sample(X_v_next, resample_grid, mode='bilinear', align_corners=True)
         reset_feat = reset_feat.permute(0, 2, 3, 1).squeeze(2) # (B, N, D)
         
@@ -353,6 +379,7 @@ class NeuralTrajectoryEvolution(nn.Module):
         B, T, D, H, W = X_v.shape
         N = H * W
         device = X_v.device
+        X_v = X_v.to(self.W_Q.weight.dtype)
         
         time_steps = list(range(T))
         if reverse:
@@ -363,17 +390,17 @@ class NeuralTrajectoryEvolution(nn.Module):
         # 0时刻初始化
         if pos_init is None:
             grid_y, grid_x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
-            pos_t = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1).unsqueeze(0).expand(B, N, 2).float()
+            pos_t = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1).unsqueeze(0).expand(B, N, 2).to(self.W_Q.weight.dtype)
         else:
             pos_t = pos_init
             
         t0 = time_steps[0]
         # 获取初始帧特征
-        grid_0 = self._get_neighborhood_grid(pos_t, H, W)[:, :, 0, :].unsqueeze(2)
+        grid_0 = self._get_neighborhood_grid(pos_t, H, W)[:, :, 60, :].unsqueeze(2).to(X_v[:, t0].dtype)
         x_t = F.grid_sample(X_v[:, t0], grid_0, mode='bilinear', align_corners=True).permute(0, 2, 3, 1).squeeze(2)
         
-        c_t = torch.ones(B, N, 1, device=device)
-        i_t = torch.zeros(B, N, 1, device=device)
+        c_t = torch.ones(B, N, 1, device=device, dtype=self.W_Q.weight.dtype)
+        i_t = torch.zeros(B, N, 1, device=device, dtype=self.W_Q.weight.dtype)
         
         x_seq.append(x_t)
         pos_seq.append(pos_t)
@@ -383,7 +410,9 @@ class NeuralTrajectoryEvolution(nn.Module):
         # 时序演化
         for t in time_steps[1:]:
             X_v_next = X_v[:, t]
-            x_t, pos_t, c_t, i_t = self._step_evolution(x_t, pos_t, c_t, X_v_next)
+            x_t, pos_t, c_t, i_t = torch.utils.checkpoint.checkpoint(
+                self._step_evolution, x_t, pos_t, c_t, X_v_next, use_reentrant=False
+            )
             x_seq.append(x_t)
             pos_seq.append(pos_t)
             c_seq.append(c_t)
@@ -407,16 +436,25 @@ class TracerMambaConnector(STCConnectorV35):
     """
     def __init__(self, config, downsample=(2, 2, 2), depth=4, mlp_depth=2, 
                  mv_stages=1, mv_depth=6, window_size=13, num_heads=32, 
-                 mlp_ratio=4.0, drop_rate=0.0, attn_drop=0.0, drop_path=0.1, 
+                 mlp_ratio=4.0, drop_rate=0.0, attn_drop=0.0, drop_path=0.0, 
                  layer_scale=None, use_attention_every=2):
                  
         super().__init__(config=config, downsample=downsample, depth=depth, mlp_depth=mlp_depth)
-        dim = self.hidden_size
+        dim = self.encoder_hidden_size  # NTE/BCM 在 vision 维度(1152)做，最后 s1 投影到 LLM
+        self.pre_norm = nn.LayerNorm(dim)  # NTE 前归一化（师兄"前面有 layernorm"）
+        self.bcm_norm = nn.LayerNorm(dim)  # s1 前归一化：LN(x + BCM(x))
         
         # 1. 挂载 NTE (Neural Trajectory Evolution)
         self.nte = NeuralTrajectoryEvolution(d_model=dim)
+        self.nte.apply(self._init_weights)
+        # 位置/置信度预测层：W_pos 用小方差让初始位移为 sub-pixel（避免漂移出图，又不落入"不动"平凡解使 loss_cyc 恒 0）；W_sim 零初始化让 fidelity 初始稳定
+        nn.init.normal_(self.nte.W_pos.weight, std=1e-3)
+        nn.init.zeros_(self.nte.W_pos.bias)
+        nn.init.zeros_(self.nte.W_sim.weight)
+        nn.init.zeros_(self.nte.W_sim.bias)
         
-        # 2. 构建BCM的 MambaVisionLayer 网络 
+        # 2. 构建BCM的 MambaVisionLayer 网络
+        from mambavision.models.mamba_vision import BiMambaVisionLayer
         total_blocks = max(1, mv_stages * mv_depth)
         dpr_all = [drop_path * i / (total_blocks - 1) if total_blocks > 1 else 0.0 for i in range(total_blocks)]
 
@@ -441,6 +479,36 @@ class TracerMambaConnector(STCConnectorV35):
             
         self.m1 = nn.Sequential(*layers)
         self.m1.apply(self._init_weights)
+
+        _last_bcm = layers[-1]
+
+        if isinstance(getattr(_last_bcm, 'downsample_b', None), nn.Identity):
+            _last_bcm.downsample_b = nn.Conv2d(_last_bcm.dim2, _last_bcm.dim2, kernel_size=1)
+        _seeded = []
+        for _name in ('W_fus', 'downsample_b'):
+            _mod = getattr(_last_bcm, _name, None)
+            if _mod is None or not any(True for _ in _mod.parameters()):
+                continue
+            for _p in _mod.parameters():
+                if _p.dim() > 1:
+                    nn.init.normal_(_p, std=1e-3)
+                else:
+                    nn.init.zeros_(_p)
+            _seeded.append(_name)
+        if 'W_fus' not in _seeded or 'downsample_b' not in _seeded:
+            raise RuntimeError('[BCM] small-init failed on %s: seeded=%s'
+                               % (type(_last_bcm).__name__, _seeded))
+        print('[BCM] small-std init of %s: %s -> m1(x) is a tiny NON-ZERO residual '
+              'at init (pre-norm residual + LayerScale alpha=1)'
+              % (type(_last_bcm).__name__, _seeded), flush=True)
+
+        # LayerScale on the BCM residual: s1 now sees LN(x + alpha * BCM(x)).
+        # alpha is initialised to 1.0 so training starts exactly as before, then
+        # the model can shrink the whole NTE+BCM branch if it is not helpful.
+        # It must NOT be initialised to 0: the last BCM layer is zero-initialised,
+        # so alpha=0 would zero the gradient into W_fus/downsample_b and the branch
+        # would stay dead forever.
+        self.alpha = nn.Parameter(torch.ones(1))
         
         
     def _init_weights(self, m):
@@ -462,7 +530,12 @@ class TracerMambaConnector(STCConnectorV35):
             x = einops.rearrange(x, "b t (h w) d -> b d t h w", h=hw, w=hw)
         elif x.ndim == 5:
             x = einops.rearrange(x, "b t h w d -> b d t h w")
-        
+
+        # NTE 前归一化：稳定 SigLIP 原始特征，避免 W_pos 预测漂移导致 loss_cyc 爆炸
+        x = einops.rearrange(x, "b d t h w -> b t h w d")
+        x = self.pre_norm(x)
+        x = einops.rearrange(x, "b t h w d -> b d t h w")
+
         B,D,T,H,W = x.shape
         X_v = einops.rearrange(x, "b d t h w -> b t d h w")
         
@@ -479,18 +552,38 @@ class TracerMambaConnector(STCConnectorV35):
             'pos_fwd': pos_fwd,   # (B, N, T, 2) 用于 Trajectory Diversity (L_div)
             'c_fwd': c_fwd,       # (B, N, T, 1) Fidelity scores 加权
             'i_fwd': i_fwd,       # (B, N, T, 1) Reset Indicators 截断
-            'pos_bwd': pos_bwd    # (B, N, T, 2) 用于 Cycle-Consistency (L_cyc)
+            'pos_bwd': pos_bwd,   # (B, N, T, 2) 用于 Cycle-Consistency (L_cyc)
+            'alpha': self.alpha.detach(),           # BCM residual scale
+            'alpha_nte': self.nte.alpha_nte.detach(),
+            'pos_gain': self.nte.pos_gain.detach(),
+            'sim_gain': self.nte.sim_gain.detach(),
         }
         
         # (3) BCM 建模 (MambaVision)
-        # 恢复回 MambaVisionLayer 习惯的 spatial batch 并行结构 (b*t, d, h, w)
+        # BiMambaVisionLayer 期望 5D 输入 (b, t, d, h, w)
         # 注意：此处 x_fwd 的 N 维度本质上是展平的 H*W
         x_mamba_in = einops.rearrange(x_fwd, "b (h w) t d -> b t d h w", h=H, w=W)
-        self.m1(x_mamba_in)
-        x_mamba_out = x_mamba_in 
-        
-        # (4) 展平成 [B, N_seq, D] 进入 LLM Projector
-        x_out = einops.rearrange(x_mamba_out, "(b t) d h w -> b (t h w) d", t=T)
+        x_mamba_out = torch.utils.checkpoint.checkpoint(self.m1, x_mamba_in, use_reentrant=False)
+
+        # (3.5) 残差 + LayerNorm：s1 吃 LN(x + BCM(x))，让 s1 输入分布稳定
+        # pre-norm residual: normalise the BASE only, then add the gated branch.
+        # Normalising the sum would let the LayerNorm Jacobian cancel the small
+        # branch signal (measured: W_fus stayed at 1.4e-4 over a whole epoch).
+        x_base = einops.rearrange(x_mamba_in, "b t d h w -> b t h w d")
+        x_base = self.bcm_norm(x_base)
+        x_base = einops.rearrange(x_base, "b t h w d -> b t d h w")
+        x_res = x_base + self.alpha * x_mamba_out
+
+        # (4) s1 后置：BCM 输出(1152) 投影到 LLM(3584) + readout
+        x_proj = einops.rearrange(x_res, "b t d h w -> (b t) d h w")
+        x_proj = self.s1(x_proj)                      # (b*t, 3584, H, W)
+        # (4.5) temporal + spatial downsampling, then readout
+        x_proj = einops.rearrange(x_proj, "(b t) d h w -> b d t h w", t=T)
+        x_proj = self.sampler(x_proj)                 # Conv3d k=s=(2,2,2), padding=0
+        t_ds = x_proj.size(2)
+        x_proj = einops.rearrange(x_proj, "b d t h w -> (b t) d h w")
+        x_proj = self.s2(x_proj)                      # RegStage(3584 -> 3584)
+        x_out = einops.rearrange(x_proj, "(b t) d h w -> b (t h w) d", t=t_ds)
         x_out = self.readout(x_out)
         
         return x_out, loss_data
