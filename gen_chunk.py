@@ -31,7 +31,19 @@ lora_model_path = (os.environ.get('EVAL_MODEL_DIR')
 output_path = f'{RESULT_ROOT}/result/{folder}-{ckpt_id}_{split}_chunk{chunk_idx}.json'
 
 modal = 'video'
-instruct = 'Use only one short sentence to describe the video.'
+GEN_KWARGS = {}
+for _k, _c in (('num_beams', int), ('length_penalty', float),
+                ('repetition_penalty', float), ('no_repeat_ngram_size', int)):
+    _v = os.environ.get('EVAL_' + _k.upper())
+    if _v not in (None, ''):
+        GEN_KWARGS[_k] = _c(_v)
+
+NUM_CAND = int(os.environ.get('EVAL_NUM_CANDIDATES', '1'))
+TEMP = float(os.environ.get('EVAL_TEMPERATURE', '0.0'))
+TOPP = float(os.environ.get('EVAL_TOP_P', '0.9'))
+
+instruct = os.environ.get('EVAL_INSTRUCT',
+                              'Use only one short sentence to describe the video.')
 model_path = 'DAMO-NLP-SG/VideoLLaMA2.1-7B-16F'
 
 config = AutoConfig.from_pretrained(model_path)
@@ -98,11 +110,28 @@ for line in chunk_lines:
     video_id = data["video_id"]
     video_path = video_dir + video_id + video_ext
     try:
-        output = mm_infer(
-            load_input(video_path), instruct,
-            model=model, tokenizer=tokenizer, do_sample=False, modal=modal
-        )
-        output = output.lower().rstrip('.')
+        if NUM_CAND > 1:
+            cands = []
+            for _ci in range(NUM_CAND):
+                try:
+                    _c = mm_infer(
+                        load_input(video_path), instruct,
+                        model=model, tokenizer=tokenizer, do_sample=True,
+                        temperature=TEMP, top_p=TOPP, modal=modal,
+                        **GEN_KWARGS
+                    )
+                    cands.append(_c.lower().rstrip('.'))
+                except Exception as _e:
+                    print(f"Error {video_id} cand{_ci}: {_e}")
+            output = cands[0] if cands else ""
+        else:
+            output = mm_infer(
+                load_input(video_path), instruct,
+                model=model, tokenizer=tokenizer, do_sample=False, modal=modal,
+                **GEN_KWARGS
+            )
+            output = output.lower().rstrip('.')
+            cands = [output]
     except Exception as e:
         print(f"Error {video_id}: {e}")
         output = ""
@@ -111,6 +140,7 @@ for line in chunk_lines:
         "image_name": video_path,
         "captions": data["golden_captions"],
         "prediction": output,
+        "candidates": cands,
     }
     print(f"[chunk{chunk_idx}] {video_id}: {output}")
     output_list.append(output_dict)

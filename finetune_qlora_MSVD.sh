@@ -28,12 +28,12 @@ export LC_ALL=C
 cd "$(dirname "$0")" || exit 1
 
 # ------------------------------- hardware -----------------------------------
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2,3}
-NPROC_PER_NODE=2
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+NPROC_PER_NODE=4
 
 # ------------------------------- batching ----------------------------------
 # per-device batch that fills the card (measured, see tools/probe_batch.sh)
-PER_DEVICE_BS=${PER_DEVICE_BS:-12}
+PER_DEVICE_BS=${PER_DEVICE_BS:-6}
 GRAD_ACC=${GRAD_ACC:-5}                       # 12 x 5 x 2 = 120 samples / step
 GRAD_CKPT=${GRAD_CKPT:-True}
 EFFECTIVE_GLOBAL=$(( PER_DEVICE_BS * GRAD_ACC * NPROC_PER_NODE ))
@@ -41,7 +41,7 @@ MAX_STEPS=${MAX_STEPS:-}                      # empty = run the full epoch
 SAVE_STEPS=${SAVE_STEPS:-50}
 
 # ------------------------------- paths -------------------------------------
-RUN_NAME=${RUN_NAME:-my_run_qlora_v9}
+RUN_NAME=${RUN_NAME:-my_run_qlora_v16}
 DATA_DIR=datasets
 FEATURE_DIR=${DATA_DIR}/MSVD_sft/siglip_feat32
 MODEL_PATH=DAMO-NLP-SG/VideoLLaMA2.1-7B-16F
