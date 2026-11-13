@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import numpy as np
 import torch
 sys.path.append('./')
 from functools import partial
@@ -14,7 +15,7 @@ from videollama2.model.videollama2_qwen2 import Videollama2Qwen2ForCausalLM
 disable_torch_init()
 
 dataset = 'MSVD'
-split = 'test'
+split = os.environ.get('EVAL_SPLIT', 'test')
 folder = os.environ.get('EVAL_FOLDER', 'my_run_qlora_v7')
 ckpt_id = int(os.environ.get('EVAL_CKPT', '200'))
 chunk_idx = int(sys.argv[1])
@@ -47,10 +48,27 @@ instruct = os.environ.get('EVAL_INSTRUCT',
 model_path = 'DAMO-NLP-SG/VideoLLaMA2.1-7B-16F'
 
 config = AutoConfig.from_pretrained(model_path)
-config.mm_projector_type = 'route_mamba'
+# Vim 单块空间分支：从 checkpoint 的 config.json 读 projector 类型，保证推理时构建
+# 与训练一致的 connector（route_mamba vs vim_spatial）。否则 Vim-S checkpoint 会被
+# 错误地当 route_mamba 加载（空间参数 s1_s/sp_mamba 被 strict=False 忽略）→ 评测作废。
+_ckpt_cfg_path = os.path.join(lora_model_path, 'config.json')
+if os.path.exists(_ckpt_cfg_path):
+    _ckpt_cfg = json.load(open(_ckpt_cfg_path, encoding='utf-8'))
+    config.mm_projector_type = _ckpt_cfg.get('mm_projector_type', 'route_mamba')
+    # 方案 v2：tracer_vim_cross 的 fusion/scan/align 开关必须与训练一致，
+    # 否则默认 st_fusion_mode='off' 会静默退化成 B0。
+    for _k in ('st_fusion_mode', 'st_scan_mode', 'st_align_mode',
+               'st_fusion_scale', 'st_rank_weight', 'st_frame_chunk'):
+        if _k in _ckpt_cfg:
+            setattr(config, _k, _ckpt_cfg[_k])
+else:
+    config.mm_projector_type = 'route_mamba'
 
 # ---- cached SigLIP features: never build or load the vision tower ----
-FEATURE_DIR = os.environ.get('MSVD_FEATURE_DIR', 'datasets/MSVD_sft/siglip_feat16')
+# 主口径 feat32（+ uniform 16/32）：旧 B0 在此口径下 final=187.79≈论文 187.70、peak 195；
+# 而 GitHub 仓库默认的 feat16 实测整体低 ~7 分（旧 B0 final 180.80）。故默认 feat32。
+# 如需完全照仓库 feat16 原样评测：EVAL_FEATURE_DIR=datasets/MSVD_sft/siglip_feat16。
+FEATURE_DIR = os.environ.get('EVAL_FEATURE_DIR', 'datasets/MSVD_sft/siglip_feat32')
 USE_FEATURE_CACHE = os.environ.get('USE_FEATURE_CACHE', '1') == '1'
 if USE_FEATURE_CACHE:
     config.mm_vision_tower = 'precomputed'
@@ -86,6 +104,16 @@ if USE_FEATURE_CACHE:
         feat_path = os.path.join(FEATURE_DIR, vid + '.npy')
         if not os.path.exists(feat_path):
             raise FileNotFoundError(f'feature cache miss: {feat_path}')
+        # 与 GitHub 权威版（62ad82c）一致：默认 feat16，直接读全部 16 帧、不采样。
+        # 仅当显式把 EVAL_FEATURE_DIR 指到 feat32 cache 时，才按训练 uniform 规则挑 16/32
+        # （供可选的 feat32 对照实验；主口径是 feat16）。
+        if 'feat32' in FEATURE_DIR:
+            _idx_env = os.environ.get('EVAL_FRAME_INDICES')
+            if _idx_env:
+                idx = np.array([int(x) for x in _idx_env.split(',')], dtype=np.int64)
+            else:
+                idx = np.linspace(0, 31, 16).round().astype(np.int64)
+            return load_video_features(feat_path, idx)
         return load_video_features(feat_path)
 else:
     vision_tower = model.get_vision_tower()

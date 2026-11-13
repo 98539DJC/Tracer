@@ -72,6 +72,18 @@ def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
     return to_return
 
 
+def get_mm_projector_state_maybe_zero_3(named_params):
+    """Save the WHOLE mm_projector (temporal + spatial) regardless of requires_grad.
+
+    Used by Stage1 (trainable_scope='spatial'): the temporal branch is frozen in
+    training, so `get_peft_state_non_lora_maybe_zero_3(require_grad_only=True)`
+    would drop it from the checkpoint and evaluation could not reload pre_norm.
+    """
+    to_return = {k: t for k, t in named_params if "mm_projector" in k and "lora_" not in k}
+    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    return to_return
+
+
 def find_all_linear_names(model):
     cls = torch.nn.Linear
     lora_module_names = set()
@@ -263,7 +275,9 @@ class VideoLLaMA2Trainer(Trainer):
                 nte_bcm_parameters = [n for n in projector_parameters
                                       if ".nte." in n or ".m1." in n or n.endswith(_GATE)]
                 pretrained_projector = [n for n in projector_parameters if n not in nte_bcm_parameters]
-                nte_bcm_lr = self.args.mm_projector_lr * 2.0
+                # Vim 单块空间分支方案 §8.1：非 LoRA 参数统一 1e-4（默认 ×1.0）。
+                # 复现 HEAD(62ad82c) 的 B0 基线时用 NTE_BCM_LR_MULT=2.0 恢复原配方。
+                nte_bcm_lr = self.args.mm_projector_lr * float(os.environ.get('NTE_BCM_LR_MULT', '1.0'))
                 _req = [n for n, p in opt_model.named_parameters() if p.requires_grad]
                 print(f'[CREATE_OPTIM] req_grad={len(_req)} decay={len(decay_parameters)} projector={len(projector_parameters)} nte_bcm={len(nte_bcm_parameters)}', flush=True)
                 optimizer_grouped_parameters = [
@@ -371,7 +385,13 @@ class VideoLLaMA2Trainer(Trainer):
                 output_dir = os.path.join(run_dir, checkpoint_folder)
 
                 state_dict = get_peft_state_maybe_zero_3(self.model.named_parameters(), self.args.lora_bias)
-                non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
+                if getattr(self.args, 'trainable_scope', 'default') in ('spatial', 'fusion', 'lora', 'st'):
+                    # lora 档（Stage2）冻结了整个 mm_projector；若走 require_grad_only，
+                    # 中间 checkpoint 的 non_lora_trainables.bin 会为空 → 评中间 ckpt 时
+                    # 时间/空间分支退化为随机初始化。必须整包保存（与 train.py 末次保存一致）。
+                    non_lora_state_dict = get_mm_projector_state_maybe_zero_3(self.model.named_parameters())
+                else:
+                    non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(self.model.named_parameters())
                 if self.args.local_rank == 0 or self.args.local_rank == -1:
                     self.model.config.save_pretrained(output_dir)
                     torch.save(non_lora_state_dict, os.path.join(output_dir, 'non_lora_trainables.bin'))
@@ -395,7 +415,11 @@ class VideoLLaMA2Trainer(Trainer):
         if task_loss is None:
             # 兼容某些返回 tuple 的模型结构
             task_loss = outputs[0]
-            
+
+        # NOTE: 不用 micro-batch 缩放。B0 基线是 bs3×acc10 + wordweight_normalize=sum 原样训练，
+        # 阶段 A/B 也统一 bs3；加缩放会把 caption 梯度相对 B0 放大 2 倍，偏离方案 §7
+        # 「保持现有归约一致」。保持与 B0 完全相同的 caption 归约即可直接可比。
+
         # 3. 提取 Tracer 产生的轨迹中间数据
         loss_data = outputs.get("loss_data", None)
         
@@ -472,14 +496,32 @@ class VideoLLaMA2Trainer(Trainer):
             loss_cor = loss_cor / AUX_LOSS_SCALE["loss_cor"]
             loss_cyc = loss_cyc / AUX_LOSS_SCALE["loss_cyc"]
             loss_div = loss_div / AUX_LOSS_SCALE["loss_div"]
-            
-            total_loss = total_loss + (gamma_1 * loss_cor) + (gamma_2 * loss_cyc) + (gamma_3 * loss_div)
+
+            # 方案 v2：A1-A5（冻结时间分支）只反传 caption；从头联合训练时
+            # ST_AUX_LOSS=1，恢复 cor/cyc/div（与 B0/C-Joint 的原损失一致）。
+            _add_aux = os.environ.get('ST_AUX_LOSS', '1') == '1'
+            if _add_aux:
+                total_loss = total_loss + (gamma_1 * loss_cor) + (gamma_2 * loss_cyc) + (gamma_3 * loss_div)
+
+            # 低秩正则（默认权重 0；独立对照才开）
+            _cfg = getattr(model, 'config', None)
+            if _cfg is None:
+                _cfg = getattr(getattr(self.model, 'module', self.model), 'config', None)
+            _rank_w = float(getattr(_cfg, 'st_rank_weight', 0.0)) if _cfg is not None \
+                else float(os.environ.get('ST_RANK_WEIGHT', '0'))
+            _st_rank = loss_data.get('st_rank_loss') if isinstance(loss_data, dict) else None
+            if _st_rank is not None and _rank_w > 0:
+                total_loss = total_loss + _rank_w * _st_rank
             _log = {
                 "loss_ce": task_loss.detach().item(),
                 "loss_cor": loss_cor.detach().item(),
                 "loss_cyc": loss_cyc.detach().item(),
                 "loss_div": loss_div.detach().item(),
             }
+            if isinstance(loss_data, dict) and loss_data.get('st_rank_loss') is not None:
+                _log['st_rank_loss'] = float(loss_data['st_rank_loss'].detach())
+            if isinstance(loss_data, dict) and loss_data.get('st_delta_ratio') is not None:
+                _log['st_delta_ratio'] = float(loss_data['st_delta_ratio'].detach())
             for _k in ('alpha', 'alpha_nte', 'pos_gain', 'sim_gain'):
                 _v = loss_data.get(_k)
                 if _v is not None:

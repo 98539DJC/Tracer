@@ -60,7 +60,8 @@ DeepSpeedEngine.no_sync = _no_sync_null
 from videollama2.constants import NUM_FRAMES, IGNORE_INDEX, MODAL_INDEX_MAP
 from videollama2.mm_utils import tokenizer_multimodal_token, process_video, process_image, load_video_features
 from videollama2.videollama2_trainer import (VideoLLaMA2Trainer,
-    get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3, 
+    get_peft_state_maybe_zero_3, get_peft_state_non_lora_maybe_zero_3,
+    get_mm_projector_state_maybe_zero_3,
     find_all_linear_names, safe_save_model_for_hf_trainer
 )
 
@@ -85,11 +86,20 @@ def set_seed(seed=42):
 
     :param seed: An integer value to be used as the random seed.
     """
+    import random
+    import numpy as np
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+    np.random.seed(seed)
+    random.seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # 诊断开关（默认不改 cuDNN 行为）：设 DISABLE_CUDNN=1 可临时禁用 cuDNN，
+    # 用于对比"cuDNN vs 原生 conv"是否与崩溃相关。默认 '0' 保持原样。
+    if os.environ.get('DISABLE_CUDNN', '0') == '1':
+        torch.backends.cudnn.enabled = False
+        print('[CUDNN] disabled by DISABLE_CUDNN=1 (diagnostic only)', flush=True)
 
 
 @dataclass
@@ -112,6 +122,22 @@ class ModelArguments:
                           "'count' = sum(w*ce)/num_valid_tokens."})
     tune_mm_mlp_adapter: bool = field(default=False)
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
+    # ---- 方案 v2：Tracer + Vim Cross-Mamba + RFM ----
+    st_fusion_mode: str = field(
+        default='off',
+        metadata={"help": "'off' (B0) | 'conv' (A1) | 'rfm' (A2-A5)"})
+    st_scan_mode: str = field(
+        default='off',
+        metadata={"help": "'off' | 'self' (A3) | 'cross' (A4/A5)"})
+    st_align_mode: str = field(
+        default='nte_center',
+        metadata={"help": "'nte_center' (A1-A4, NTE 实际采样中心) | 'slot' (A5, 初始槽位)"})
+    st_fusion_scale: float = field(
+        default=0.1, metadata={"help": "γ，固定融合残差系数（方案 §5.2）"})
+    st_rank_weight: float = field(
+        default=0.0, metadata={"help": "低秩正则权重（A1-A5 为 0）"})
+    st_frame_chunk: int = field(
+        default=2, metadata={"help": "RFM 分块大小（按 b 个视频的帧数）"})
     # Vision tower Arguments
     vision_tower: Optional[str] = field(default=None)
     # Precomputed-feature Arguments (SigLIP removed from the training loop)
@@ -181,6 +207,19 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_dropout: float = 0.05
     lora_weight_path: str = ""
     lora_bias: str = "none"
+    # ---- 两阶段实验（空间单分支 → 双分支拼接适配）----
+    trainable_scope: str = field(
+        default="default",
+        metadata={"help": "trainable scope: 'default' | 'spatial' (Stage1 只训空间分支) | 'lora' (Stage2 只训 LoRA)"}
+    )
+    lora_init_path: str = field(
+        default="",
+        metadata={"help": "Path to a saved adapter_model.{bin,safetensors} to load as LoRA init (e.g. B0's adapter)."}
+    )
+    spatial_init_path: str = field(
+        default="",
+        metadata={"help": "Path to a non_lora_trainables.bin containing trained spatial-branch weights to load (Stage2)."}
+    )
 
 
 def preprocess_plain(
@@ -557,12 +596,13 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 
 def train(attn_implementation=None):
     global local_rank
-    # 设置随机种子确保实验可重复性
-    set_seed(42)
-    
+
     # 解析命令行参数到三个数据类: 模型参数、数据参数、训练参数
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    # 设置随机种子确保实验可重复性（--seed，默认 42，来自 transformers.TrainingArguments）
+    set_seed(training_args.seed)
 
     local_rank = training_args.local_rank   # 分布式训练中的本地进程编号
     # 根据训练精度设置计算数据类型(f16/bf32/fp32)
@@ -725,6 +765,91 @@ def train(attn_implementation=None):
         model.get_model().vision_tower.requires_grad_(False)   # 冻结vision_tower
         model.get_model().mm_projector.requires_grad_(True)    # 解冻mm_projector
 
+    # ---- 两阶段实验：自定义 trainable scope + 初始权重加载 --------------------
+    _scope = getattr(training_args, 'trainable_scope', 'default')
+    if _scope == 'spatial':
+        # Stage1：冻结一切（LLM 主干、LoRA、时间投影器 NTE/BCM/P_T、共享 pre_norm），
+        # 仅训练空间分支（sp_norm + Vim + P_S）。梯度仍能穿过冻结的 LLM/LoRA 回传到空间 token
+        # （这里只用 requires_grad=False，绝不 no_grad 包住 LLM 前向）。
+        model.requires_grad_(False)
+        _spatial_markers = ('sp_mamba', 'sp_norm', 's1_s', 'sampler_s', 's2_s', 'readout_s')
+        _n_unfrozen = 0
+        for _n, _p in model.named_parameters():
+            if any(_m in _n for _m in _spatial_markers):
+                _p.requires_grad = True
+                _n_unfrozen += 1
+        rank0_print(f'[SCOPE] spatial: frozen all but {_n_unfrozen} spatial-branch params')
+    elif _scope == 'lora':
+        # Stage2：冻结整个 mm_projector（两路分支 + 投影器 + 共享 pre_norm），仅训练 LoRA。
+        for _p in model.get_model().mm_projector.parameters():
+            _p.requires_grad = False
+        rank0_print('[SCOPE] lora: mm_projector frozen, only LoRA trainable')
+    elif _scope == 'fusion':
+        # 阶段 B：冻结时间/空间两路分支 + 投影器 + 共享 pre_norm，只训融合模块 + LoRA。
+        for _n, _p in model.named_parameters():
+            if 'mm_projector' in _n:
+                _p.requires_grad = False
+        _fusion_markers = ('fuse',)
+        _n_unfrozen = 0
+        for _n, _p in model.named_parameters():
+            if 'mm_projector' in _n and any(_m in _n for _m in _fusion_markers):
+                _p.requires_grad = True
+                _n_unfrozen += 1
+        rank0_print(f'[SCOPE] fusion: mm_projector frozen except {_n_unfrozen} fusion params; LoRA trainable')
+    elif _scope == 'st':
+        # 方案 v2 A1-A5：冻结 SigLIP / 共享 pre_norm / B0 时间侧 / 原投影器 / LLM+LoRA，
+        # 只训新增模块（sp_norm + Vim + 扫描 + 融合）。梯度仍穿过冻结路径回传到新模块。
+        model.requires_grad_(False)
+        _st_markers = ('sp_mamba', 'sp_norm', 'scan_ts', 'scan_st', 'fuse')
+        _n_unfrozen = 0
+        for _n, _p in model.named_parameters():
+            if 'mm_projector' in _n and any(_m in _n for _m in _st_markers):
+                _p.requires_grad = True
+                _n_unfrozen += 1
+        rank0_print(f'[SCOPE] st: frozen all but {_n_unfrozen} new-path params '
+                    f'(Vim + Cross-Mamba + fusion)')
+    else:
+        rank0_print('[SCOPE] default: LoRA + mm_projector trainable')
+
+    # 加载 LoRA init（B0 的 adapter_model.*）。
+    # 注意：peft 保存的 adapter 键是 `...lora_A.weight`（无 adapter 名），而
+    # named_parameters() 是 `...lora_A.default.weight`（带 "default"）。需插入 `.default` 对齐。
+    if getattr(training_args, 'lora_init_path', ''):
+        _lp = training_args.lora_init_path
+        if _lp.endswith('.safetensors'):
+            from safetensors.torch import load_file as _load_sf
+            _adapter_sd = _load_sf(_lp)
+        else:
+            _adapter_sd = torch.load(_lp, map_location='cpu')
+        _model_params = dict(model.named_parameters())
+        _n_loaded = 0
+        for _k, _v in _adapter_sd.items():
+            _target = _k
+            if _target not in _model_params:
+                for _sfx in ('.weight', '.bias'):
+                    if _target.endswith(_sfx):
+                        _cand = _target[:-len(_sfx)] + '.default' + _sfx
+                        if _cand in _model_params:
+                            _target = _cand
+                            break
+            if _target in _model_params:
+                _model_params[_target].data.copy_(_v.to(_model_params[_target].dtype))
+                _n_loaded += 1
+        rank0_print(f'[INIT] loaded {_n_loaded}/{len(_adapter_sd)} LoRA tensors from {_lp}')
+
+    # 加载空间分支 init（Stage1 训好的 sp_norm/Vim/P_S），覆盖 hook 复制的初值。
+    if getattr(training_args, 'spatial_init_path', ''):
+        _sp = training_args.spatial_init_path
+        _spatial_sd = torch.load(_sp, map_location='cpu')
+        _model_params = dict(model.named_parameters())
+        _spatial_markers = ('sp_mamba', 'sp_norm', 's1_s', 'sampler_s', 's2_s', 'readout_s')
+        _n_loaded = 0
+        for _k, _v in _spatial_sd.items():
+            if any(_m in _k for _m in _spatial_markers) and _k in _model_params:
+                _model_params[_k].data.copy_(_v.to(_model_params[_k].dtype))
+                _n_loaded += 1
+        rank0_print(f'[INIT] loaded {_n_loaded}/{len(_spatial_sd)} spatial tensors from {_sp}')
+
     # 量化模型参数精度调整
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -797,7 +922,12 @@ def train(attn_implementation=None):
     if training_args.lora_enable:
         # 分离保存LoRA参数和基础模型参数
         state_dict = get_peft_state_maybe_zero_3(model.named_parameters(), training_args.lora_bias)
-        non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
+        if getattr(training_args, 'trainable_scope', 'default') in ('spatial', 'fusion', 'lora', 'st'):
+            # spatial/fusion/lora 三档都冻结了部分或全部 mm_projector，
+            # require_grad_only 会丢掉冻结的 temporal/spatial 分支 → 评测无法重建。
+            non_lora_state_dict = get_mm_projector_state_maybe_zero_3(model.named_parameters())
+        else:
+            non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(model.named_parameters())
         if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)

@@ -54,19 +54,27 @@ echo "   output   : $EVAL_OUT_DIR" | tee -a "$MAIN"
 echo "==============================================================================" | tee -a "$MAIN"
 
 CKPT_DIR="$EVAL_OUT_DIR/checkpoints/${RUN_NAME}/checkpoint-${CKPT}"
+# 训练训满 max_steps 后最终模型可能保存在 run 根目录，不生成 checkpoint-${CKPT}/ 子目录；
+# 此时回退到 run 根目录（含 non_lora_trainables.bin + adapter_model.* + config.json）。
+RUN_DIR="$EVAL_OUT_DIR/checkpoints/${RUN_NAME}"
+if [ ! -d "$CKPT_DIR" ] && [ -f "$RUN_DIR/non_lora_trainables.bin" ]; then
+  echo "no checkpoint-${CKPT}/ dir -> using run root ${RUN_DIR} (final model)" | tee -a "$MAIN"
+  CKPT_DIR="$RUN_DIR"
+fi
 if [ "$INFER" != "0" ]; then
-  for f in non_lora_trainables.bin adapter_model.safetensors; do
-    if [ ! -f "$CKPT_DIR/$f" ]; then
-      echo "ERROR: $CKPT_DIR/$f not found" | tee -a "$MAIN"; exit 1
-    fi
-  done
+  if [ ! -f "$CKPT_DIR/non_lora_trainables.bin" ]; then
+    echo "ERROR: $CKPT_DIR/non_lora_trainables.bin not found" | tee -a "$MAIN"; exit 1
+  fi
+  if [ ! -f "$CKPT_DIR/adapter_model.safetensors" ] && [ ! -f "$CKPT_DIR/adapter_model.bin" ]; then
+    echo "ERROR: no adapter_model in $CKPT_DIR" | tee -a "$MAIN"; exit 1
+  fi
   echo "checkpoint found: $CKPT_DIR" | tee -a "$MAIN"
 
   # ---- sharded inference, one shard per GPU -------------------------------
   echo "--- inference ---" | tee -a "$MAIN"
   i=0
   for gpu in $(echo "$EVAL_GPUS" | tr ',' ' '); do
-    CUDA_VISIBLE_DEVICES=$gpu EVAL_FOLDER=$RUN_NAME EVAL_CKPT=$CKPT \
+    CUDA_VISIBLE_DEVICES=$gpu EVAL_FOLDER=$RUN_NAME EVAL_CKPT=$CKPT EVAL_MODEL_DIR=$CKPT_DIR \
         $PY -u gen_chunk.py $i $N_CHUNKS > "$LOG_DIR/gen_${RUN_NAME}-${CKPT}_chunk${i}.log" 2>&1 &
     i=$(( i + 1 ))
   done

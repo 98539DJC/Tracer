@@ -73,6 +73,12 @@ class Videollama2MetaModel:
 
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
+        # ---- 方案 v2（Tracer + Vim Cross-Mamba + RFM）架构字段 ----
+        # 必须在 build_vision_projector 之前写入 config，且随后会随 checkpoint 保存。
+        for _k in ('st_fusion_mode', 'st_scan_mode', 'st_align_mode',
+                   'st_fusion_scale', 'st_rank_weight', 'st_frame_chunk'):
+            if hasattr(model_args, _k):
+                setattr(self.config, _k, getattr(model_args, _k))
         self.config.mm_hidden_size = vision_tower.hidden_size
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
@@ -230,9 +236,9 @@ class Videollama2MetaForCausalLM(ABC):
         # *********** time  ************
         elif "tc_connector" in self.config.mm_projector_type or "tp_connector" in self.config.mm_projector_type:
             video_features = self.get_model().mm_projector(frames_features)
-        elif "tracer" in self.config.mm_projector_type or "route_mamba" in self.config.mm_projector_type or "mamba" in self.config.mm_projector_type:
+        elif "tracer" in self.config.mm_projector_type or "route_mamba" in self.config.mm_projector_type or "mamba" in self.config.mm_projector_type or "vim_spatial" in self.config.mm_projector_type or "tracer_vim_cross" in self.config.mm_projector_type:
             video_features, loss_data = self.get_model().mm_projector(frames_features)
-            return video_features, loss_data    
+            return video_features, loss_data
         else:
             raise Exception(f"Unsupported projector type {self.config.mm_projector_type}!!!")
 
